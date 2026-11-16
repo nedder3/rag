@@ -1,0 +1,36 @@
+services:
+  rag-postgres:
+    image: pgvector/pgvector:pg17
+    container_name: rag-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${RAG_PG_DB:-rag_db}
+      POSTGRES_USER: ${RAG_PG_USER:-rag_admin}
+      POSTGRES_PASSWORD: ${RAG_PG_PASSWORD:-rag_dev_password}
+    ports:
+      - "${RAG_PG_PORT:-5433}:5432"
+    volumes:
+      - rag_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${RAG_PG_USER:-rag_admin} -d ${RAG_PG_DB:-rag_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rag-api:
+    build: .
+    container_name: rag-api
+    restart: unless-stopped
+    depends_on:
+      rag-postgres:
+        condition: service_healthy
+    environment:
+      RAG_DATABASE_URL: postgresql://${RAG_PG_USER:-rag_admin}:${RAG_PG_PASSWORD:-rag_dev_password}@rag-postgres:5432/${RAG_PG_DB:-rag_db}
+      RAG_OLLAMA_URL: ${RAG_OLLAMA_URL:-http://host.docker.internal:11434}
+      RAG_EMBED_MODEL: ${RAG_EMBED_MODEL:-nomic-embed-text}
+      RAG_BIND_ADDR: 0.0.0.0:8010
+    ports:
+      - "${RAG_API_PORT:-8010}:8010"
+
+volumes:
+  rag_pg_data:
