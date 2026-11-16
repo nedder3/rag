@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use crate::application::ports::{EmbeddingProvider, RagRepository};
 use crate::domain::models::{
-    GraphEdge, GraphNeighbor, GraphNode, IngestDocument, QueryOptions, QueryResponse, SearchHit,
-    TelemetrySnapshot,
+    DpoExportRecord, GraphEdge, GraphNeighbor, GraphNode, IngestDocument, QueryOptions, QueryResponse,
+    SearchHit, TelemetrySnapshot, TraceFeedbackRequest,
 };
 
 struct CacheState {
@@ -59,14 +59,14 @@ impl RagService {
     }
 
     async fn embed_cached(&self, text: &str) -> Result<Vec<f32>, String> {
-        let key = text.trim().to_string();
+        let key = format!("{}:{}", self.embedder.model_name(), text.trim());
         if let Ok(mut st) = self.state.lock() {
             if let Some(vec) = st.embed.get(&key).cloned() {
                 st.embed_cache_hits += 1;
                 return Ok(vec);
             }
         }
-        let vec = self.embedder.embed(&key).await?;
+        let vec = self.embedder.embed(text.trim()).await?;
         if let Ok(mut st) = self.state.lock() {
             st.embed.put(key, vec.clone());
         }
@@ -74,6 +74,9 @@ impl RagService {
     }
 
     pub async fn ingest_document(&self, doc: IngestDocument) -> Result<String, String> {
+        self.repo
+            .ensure_collection_model(&doc.collection, self.embedder.model_name(), self.embedder.dimensions())
+            .await?;
         let scoped_id = if doc.document_id.contains("::") {
             doc.document_id.clone()
         } else {
@@ -104,6 +107,7 @@ impl RagService {
         let q_trim = opts.query.trim().to_string();
         if q_trim.is_empty() {
             return Ok(QueryResponse {
+                trace_id: None,
                 collection: opts.collection,
                 cache_hit: false,
                 latency_ms: 0.0,
@@ -111,6 +115,10 @@ impl RagService {
                 graph_neighbors: vec![],
             });
         }
+
+        self.repo
+            .ensure_collection_model(&opts.collection, self.embedder.model_name(), self.embedder.dimensions())
+            .await?;
 
         let limit = opts.limit.clamp(1, 50);
         let qkey = (opts.collection.clone(), q_trim.clone(), limit);
@@ -161,19 +169,28 @@ impl RagService {
             st.last_latency_ms = latency_ms;
         }
 
-        let retrieved_ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
-        let _ = self
+        let trace_id = self
             .repo
-            .record_trace(&opts.collection, &q_trim, &retrieved_ids, latency_ms, cache_hit)
-            .await;
+            .record_trace(&opts.collection, &q_trim, &results, latency_ms, cache_hit)
+            .await
+            .ok();
 
         Ok(QueryResponse {
+            trace_id,
             collection: opts.collection,
             cache_hit,
             latency_ms,
             results,
             graph_neighbors,
         })
+    }
+
+    pub async fn record_feedback(&self, fb: TraceFeedbackRequest) -> Result<i64, String> {
+        self.repo.record_feedback(&fb).await
+    }
+
+    pub async fn export_dpo(&self, limit: usize) -> Result<Vec<DpoExportRecord>, String> {
+        self.repo.export_dpo(limit).await
     }
 
     pub fn telemetry(&self) -> TelemetrySnapshot {

@@ -1,13 +1,17 @@
 use async_trait::async_trait;
 use pgvector::Vector;
-use serde_json::Value;
-use sqlx::postgres::PgPoolOptions;
+use serde_json::{json, Value};
+use sqlx::postgres::{PgListener, PgPoolOptions};
 use sqlx::{PgPool, Row};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
+use std::sync::Arc;
 
 use crate::application::ports::RagRepository;
-use crate::domain::models::{GraphEdge, GraphNeighbor, GraphNode, IngestDocument, SearchHit};
+use crate::application::service::RagService;
+use crate::domain::models::{
+    DpoExportRecord, GraphEdge, GraphNeighbor, GraphNode, IngestDocument, SearchHit, TraceFeedbackRequest,
+};
 
 #[derive(Clone)]
 pub struct PostgresRagRepository {
@@ -59,8 +63,37 @@ impl PostgresRagRepository {
             .map_err(|e| format!("Migration failed: {e}"))
     }
 
+    /// Spawns a background Tokio task listening to `rag_cache_invalidate` NOTIFY events
+    /// so L1 caches stay consistent across `rag-server`, `rag-mcp`, and replicas.
+    pub fn spawn_cache_invalidation_listener(&self, service: Arc<RagService>) -> tokio::task::JoinHandle<()> {
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            loop {
+                match PgListener::connect_with(&pool).await {
+                    Ok(mut listener) => {
+                        if listener.listen("rag_cache_invalidate").await.is_err() {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            continue;
+                        }
+                        while let Ok(_notif) = listener.recv().await {
+                            service.clear_cache();
+                        }
+                    }
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        })
+    }
+
     pub async fn delete_test_data(&self, collection: &str, node_ids: &[String]) -> Result<(), String> {
         sqlx::query("DELETE FROM rag_store.documents WHERE collection = $1")
+            .bind(collection)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        sqlx::query("DELETE FROM rag_store.collections WHERE name = $1")
             .bind(collection)
             .execute(&self.pool)
             .await
@@ -89,6 +122,40 @@ impl RagRepository for PostgresRagRepository {
             .await
             .map_err(|e| e.to_string())?;
         Ok(row.get::<i64, _>("cnt"))
+    }
+
+    async fn ensure_collection_model(&self, collection: &str, model: &str, dimensions: usize) -> Result<(), String> {
+        if matches!(collection, "*" | "all" | "auto" | "") {
+            return Ok(());
+        }
+        let existing = sqlx::query(
+            "SELECT embedding_model, dimensions FROM rag_store.collections WHERE name = $1",
+        )
+        .bind(collection)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if let Some(row) = existing {
+            let reg_model: String = row.get("embedding_model");
+            let reg_dim: i32 = row.get("dimensions");
+            if reg_model != model || reg_dim != dimensions as i32 {
+                return Err(format!(
+                    "Embedding model mismatch for collection '{collection}': registered '{reg_model}' ({reg_dim}d), active '{model}' ({dimensions}d)"
+                ));
+            }
+        } else {
+            sqlx::query(
+                "INSERT INTO rag_store.collections (name, embedding_model, dimensions) VALUES ($1, $2, $3) ON CONFLICT (name) DO NOTHING",
+            )
+            .bind(collection)
+            .bind(model)
+            .bind(dimensions as i32)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     async fn upsert_document(&self, doc: &IngestDocument, scoped_id: &str, embedding: &[f32]) -> Result<(), String> {
@@ -325,21 +392,81 @@ impl RagRepository for PostgresRagRepository {
         &self,
         collection: &str,
         query_text: &str,
-        retrieved_ids: &[String],
+        hits: &[SearchHit],
         latency_ms: f64,
         cache_hit: bool,
-    ) -> Result<(), String> {
-        sqlx::query(
-            "INSERT INTO rag_store.query_traces (collection, query_text, retrieved_ids, latency_ms, cache_hit) VALUES ($1, $2, $3, $4, $5)",
+    ) -> Result<i64, String> {
+        let retrieved_ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+        let contexts = Value::Array(
+            hits.iter()
+                .map(|h| {
+                    json!({
+                        "id": h.id,
+                        "source_path": h.source_path,
+                        "content": h.content,
+                        "rrf_score": h.rrf_score,
+                    })
+                })
+                .collect(),
+        );
+        let row = sqlx::query(
+            "INSERT INTO rag_store.query_traces (collection, query_text, retrieved_ids, retrieved_contexts, latency_ms, cache_hit) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
         )
         .bind(collection)
         .bind(query_text)
-        .bind(retrieved_ids)
+        .bind(&retrieved_ids)
+        .bind(&contexts)
         .bind(latency_ms)
         .bind(cache_hit)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
-        Ok(())
+        Ok(row.get("id"))
+    }
+
+    async fn record_feedback(&self, fb: &TraceFeedbackRequest) -> Result<i64, String> {
+        let row = sqlx::query(
+            "INSERT INTO rag_store.trace_feedback (trace_id, role, chosen, rejected, reward) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        )
+        .bind(fb.trace_id)
+        .bind(&fb.role)
+        .bind(&fb.chosen)
+        .bind(&fb.rejected)
+        .bind(fb.reward)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(row.get("id"))
+    }
+
+    async fn export_dpo(&self, limit: usize) -> Result<Vec<DpoExportRecord>, String> {
+        let rows = sqlx::query(
+            r#"
+            SELECT t.id AS trace_id, t.collection, f.role, t.query_text AS prompt,
+                   t.retrieved_contexts, f.chosen, f.rejected, f.reward
+            FROM rag_store.trace_feedback f
+            JOIN rag_store.query_traces t ON t.id = f.trace_id
+            ORDER BY f.id DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| DpoExportRecord {
+                trace_id: r.get("trace_id"),
+                collection: r.get("collection"),
+                role: r.get("role"),
+                prompt: r.get("prompt"),
+                retrieved_contexts: r.get::<Value, _>("retrieved_contexts"),
+                chosen: r.get("chosen"),
+                rejected: r.get("rejected"),
+                reward: r.get("reward"),
+            })
+            .collect())
     }
 }

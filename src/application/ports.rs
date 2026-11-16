@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 
-use crate::domain::models::{GraphEdge, GraphNeighbor, GraphNode, IngestDocument, SearchHit};
+use crate::domain::models::{
+    DpoExportRecord, GraphEdge, GraphNeighbor, GraphNode, IngestDocument, SearchHit, TraceFeedbackRequest,
+};
 
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
@@ -12,6 +14,7 @@ pub trait EmbeddingProvider: Send + Sync {
 #[async_trait]
 pub trait RagRepository: Send + Sync {
     async fn health_count(&self) -> Result<i64, String>;
+    async fn ensure_collection_model(&self, collection: &str, model: &str, dimensions: usize) -> Result<(), String>;
     async fn upsert_document(&self, doc: &IngestDocument, scoped_id: &str, embedding: &[f32]) -> Result<(), String>;
     async fn upsert_graph(&self, nodes: &[GraphNode], edges: &[GraphEdge]) -> Result<(usize, usize), String>;
     async fn hybrid_search(
@@ -31,8 +34,10 @@ pub trait RagRepository: Send + Sync {
         &self,
         collection: &str,
         query_text: &str,
-        retrieved_ids: &[String],
+        hits: &[SearchHit],
         latency_ms: f64,
         cache_hit: bool,
-    ) -> Result<(), String>;
+    ) -> Result<i64, String>;
+    async fn record_feedback(&self, fb: &TraceFeedbackRequest) -> Result<i64, String>;
+    async fn export_dpo(&self, limit: usize) -> Result<Vec<DpoExportRecord>, String>;
 }

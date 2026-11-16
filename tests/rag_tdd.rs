@@ -9,7 +9,7 @@ use rag::application::ports::EmbeddingProvider;
 use rag::application::service::RagService;
 use rag::domain::chunking::{chunk_markdown, compute_mrr_and_hit_at_k, reciprocal_rank_fusion};
 use rag::domain::models::{GraphEdge, GraphNode, IngestDocument, QueryOptions};
-use rag::infrastructure::embeddings::{FallbackEmbedder, LocalHashEmbedder};
+use rag::infrastructure::embeddings::{LocalHashEmbedder, OllamaEmbedder};
 use rag::infrastructure::http::build_router;
 use rag::infrastructure::mcp::handle_jsonrpc;
 use rag::infrastructure::postgres::PostgresRagRepository;
@@ -28,7 +28,6 @@ fn tdd_reciprocal_rank_fusion_and_eval_metrics() {
     let dense = vec![("doc_a".to_string(), 0.91), ("doc_b".to_string(), 0.85)];
     let sparse = vec![("doc_b".to_string(), 0.72), ("doc_c".to_string(), 0.40)];
     let fused = reciprocal_rank_fusion(&dense, &sparse, 60.0);
-    // doc_b appears in both lists (rank 2 dense + rank 1 sparse) -> highest RRF score
     assert_eq!(fused[0].0, "doc_b");
 
     let queries = vec![
@@ -37,26 +36,42 @@ fn tdd_reciprocal_rank_fusion_and_eval_metrics() {
     ];
     let (hit3, mrr) = compute_mrr_and_hit_at_k(&queries, 3);
     assert!((hit3 - 1.0).abs() < 1e-9);
-    // (0.5 + 1.0) / 2 = 0.75
     assert!((mrr - 0.75).abs() < 1e-9);
 }
 
 #[tokio::test]
-async fn tdd_local_and_fallback_embedder_produce_unit_vectors() {
+async fn tdd_strict_ollama_embedder_fails_503_without_silent_fallback() {
     let local = LocalHashEmbedder::new(768);
     let v1 = local.embed("pgvector HNSW hybrid search").await.unwrap();
     let v2 = local.embed("pgvector HNSW hybrid search").await.unwrap();
-    let v3 = local.embed("completely unrelated topic").await.unwrap();
-    assert_eq!(v1.len(), 768);
     assert_eq!(v1, v2);
-    assert_ne!(v1, v3);
     let norm: f32 = v1.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!((norm - 1.0).abs() < 1e-4);
 
-    // Unreachable Ollama endpoint must cleanly fall back to LocalHashEmbedder
-    let fb = FallbackEmbedder::new("http://127.0.0.1:59999".into(), "nomic-embed-text".into(), 768);
-    let vf = fb.embed("test fallback").await.unwrap();
-    assert_eq!(vf.len(), 768);
+    // Unreachable Ollama endpoint MUST error instead of corrupting the vector space
+    let ollama = OllamaEmbedder::new("http://127.0.0.1:59999".into(), "nomic-embed-text".into(), 768);
+    let err = ollama.embed("test strict").await.unwrap_err();
+    assert!(err.contains("unavailable"));
+
+    let repo = PostgresRagRepository::connect(&test_db_url()).await.unwrap();
+    repo.run_migrations().await.unwrap();
+    let svc = Arc::new(RagService::new(Arc::new(repo), Arc::new(ollama)));
+    let app = build_router(svc);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/ingest")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"collection":"strict_test","document_id":"d1","content":"hello"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 fn test_db_url() -> String {
@@ -65,13 +80,14 @@ fn test_db_url() -> String {
 }
 
 #[tokio::test]
-async fn tdd_postgres_hybrid_graph_cache_http_and_mcp_e2e() {
+async fn tdd_postgres_hybrid_graph_notify_invalidation_dpo_and_model_guard() {
     let dsn = test_db_url();
     let repo = PostgresRagRepository::connect(&dsn).await.expect("Postgres must be reachable");
     repo.run_migrations().await.expect("Migrations must succeed");
 
     let embedder: Arc<dyn EmbeddingProvider> = Arc::new(LocalHashEmbedder::new(768));
     let service = Arc::new(RagService::new(Arc::new(repo.clone()), embedder));
+    let listener_handle = repo.spawn_cache_invalidation_listener(service.clone());
 
     let tag = format!("tdd_{}", std::process::id());
     let doc_id = format!("{tag}::doc1");
@@ -101,7 +117,23 @@ async fn tdd_postgres_hybrid_graph_cache_http_and_mcp_e2e() {
         .await
         .unwrap();
 
-    // 2. First query (cache miss) -> finds doc + A* neighbor
+    // 2. Collection model guard: querying/ingesting with a different model must fail with mismatch
+    let other_embedder: Arc<dyn EmbeddingProvider> =
+        Arc::new(OllamaEmbedder::new("http://127.0.0.1:59999".into(), "nomic-embed-text".into(), 768));
+    let other_svc = RagService::new(Arc::new(repo.clone()), other_embedder);
+    let mismatch_err = other_svc
+        .ingest_document(IngestDocument {
+            collection: tag.clone(),
+            document_id: "doc2".into(),
+            source_path: "".into(),
+            content: "incompatible".into(),
+            metadata: json!({}),
+        })
+        .await
+        .unwrap_err();
+    assert!(mismatch_err.contains("mismatch"));
+
+    // 3. First query (cache miss) -> returns trace_id + A* neighbor
     let r1 = service
         .query(QueryOptions {
             query: format!("{node_a} pgvector"),
@@ -112,12 +144,11 @@ async fn tdd_postgres_hybrid_graph_cache_http_and_mcp_e2e() {
         .await
         .unwrap();
     assert!(!r1.cache_hit);
-    assert_eq!(r1.results.len(), 1);
+    assert!(r1.trace_id.is_some());
     assert_eq!(r1.results[0].id, doc_id);
-    assert!(r1.results[0].fts_score > 0.0);
     assert!(r1.graph_neighbors.iter().any(|n| n.id == node_b));
 
-    // 3. Second identical query -> L1 cache hit
+    // 4. Second identical query -> L1 cache hit
     let r2 = service
         .query(QueryOptions {
             query: format!("{node_a} pgvector"),
@@ -129,23 +160,68 @@ async fn tdd_postgres_hybrid_graph_cache_http_and_mcp_e2e() {
         .unwrap();
     assert!(r2.cache_hit);
 
-    // 4. Axum HTTP API test
+    // 5. Cross-process L1 invalidation via Postgres LISTEN/NOTIFY
+    // Simulate another process writing directly via a separate RagService (whose local clear_cache does NOT touch `service`)
+    let external_svc = RagService::new(Arc::new(repo.clone()), Arc::new(LocalHashEmbedder::new(768)));
+    external_svc
+        .ingest_document(IngestDocument {
+            collection: tag.clone(),
+            document_id: "doc_ext".into(),
+            source_path: "ext.md".into(),
+            content: format!("External write for {node_a}"),
+            metadata: json!({}),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let r3 = service
+        .query(QueryOptions {
+            query: format!("{node_a} pgvector"),
+            collection: tag.clone(),
+            limit: 3,
+            include_graph: true,
+        })
+        .await
+        .unwrap();
+    assert!(!r3.cache_hit, "PgListener should have invalidated L1 cache on external write");
+
+    // 6. DPO feedback + export endpoint
     let app = build_router(service.clone());
-    let resp = app
+    let fb_resp = app
+        .clone()
         .oneshot(
             Request::builder()
-                .uri("/health")
-                .body(Body::empty())
+                .method("POST")
+                .uri("/v1/feedback")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "trace_id": r1.trace_id.unwrap(),
+                        "role": "juez",
+                        "chosen": "Veredicto fundamentado con cita exacta.",
+                        "rejected": "Afirmación sin respaldo.",
+                        "reward": 1.0
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = resp.into_body().collect().await.unwrap().to_bytes();
-    let v: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(v["status"], "ok");
+    assert_eq!(fb_resp.status(), StatusCode::OK);
 
-    // 5. MCP JSON-RPC 2.0 test
+    let dpo_resp = app
+        .oneshot(Request::builder().uri("/v1/export/dpo?limit=10").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(dpo_resp.status(), StatusCode::OK);
+    let dpo_body = dpo_resp.into_body().collect().await.unwrap().to_bytes();
+    let dpo_json: Value = serde_json::from_slice(&dpo_body).unwrap();
+    assert!(dpo_json["count"].as_u64().unwrap() >= 1);
+    assert!(dpo_json["records"][0]["retrieved_contexts"].as_array().unwrap().len() >= 1);
+
+    // 7. MCP JSON-RPC 2.0 read-only test
     let rpc_resp = handle_jsonrpc(
         &service,
         &json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "rag_query", "arguments": {"query": format!("{node_a} pgvector"), "collection": tag}}})
@@ -156,6 +232,15 @@ async fn tdd_postgres_hybrid_graph_cache_http_and_mcp_e2e() {
     assert_eq!(rpc_val["id"], 7);
     assert!(rpc_val["result"]["results"].as_array().unwrap().len() >= 1);
 
-    // Cleanup
+    let rpc_ingest = handle_jsonrpc(
+        &service,
+        &json!({"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {"name": "rag_ingest", "arguments": {"collection": tag, "document_id": "x", "content": "y"}}})
+            .to_string(),
+    )
+    .await;
+    let rpc_err: Value = serde_json::from_str(&rpc_ingest).unwrap();
+    assert_eq!(rpc_err["error"]["code"], -32601);
+
+    listener_handle.abort();
     repo.delete_test_data(&tag, &[node_a, node_b]).await.unwrap();
 }

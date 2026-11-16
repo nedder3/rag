@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 
 use crate::application::ports::EmbeddingProvider;
 
-/// Deterministic local unit-norm feature-hashed embedder (zero external runtime required).
+/// Deterministic local unit-norm feature-hashed embedder (for tests/CI or explicit `local` collections).
 pub struct LocalHashEmbedder {
     dim: usize,
 }
@@ -60,16 +60,15 @@ struct OllamaEmbedResp {
     embedding: Option<Vec<f32>>,
 }
 
-/// Robust embedding provider: calls Ollama `/api/embed` when reachable and falls back cleanly to `LocalHashEmbedder`.
-pub struct FallbackEmbedder {
+/// Strict Ollama `/api/embed` provider. Never falls back silently to an incompatible vector space.
+pub struct OllamaEmbedder {
     client: reqwest::Client,
     ollama_url: String,
     model: String,
     dim: usize,
-    fallback: LocalHashEmbedder,
 }
 
-impl FallbackEmbedder {
+impl OllamaEmbedder {
     pub fn new(ollama_url: String, model: String, dim: usize) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
@@ -80,13 +79,12 @@ impl FallbackEmbedder {
             ollama_url: ollama_url.trim_end_matches('/').to_string(),
             model,
             dim,
-            fallback: LocalHashEmbedder::new(dim),
         }
     }
 }
 
 #[async_trait]
-impl EmbeddingProvider for FallbackEmbedder {
+impl EmbeddingProvider for OllamaEmbedder {
     fn model_name(&self) -> &str {
         &self.model
     }
@@ -97,7 +95,7 @@ impl EmbeddingProvider for FallbackEmbedder {
 
     async fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
         let url = format!("{}/api/embed", self.ollama_url);
-        if let Ok(resp) = self
+        let resp = self
             .client
             .post(&url)
             .json(&OllamaEmbedReq {
@@ -106,21 +104,51 @@ impl EmbeddingProvider for FallbackEmbedder {
             })
             .send()
             .await
-        {
-            if resp.status().is_success() {
-                if let Ok(parsed) = resp.json::<OllamaEmbedResp>().await {
-                    let maybe_vec = parsed
-                        .embeddings
-                        .and_then(|mut v| if v.is_empty() { None } else { Some(v.remove(0)) })
-                        .or(parsed.embedding);
-                    if let Some(v) = maybe_vec {
-                        if v.len() == self.dim {
-                            return Ok(v);
-                        }
-                    }
-                }
-            }
+            .map_err(|e| format!("Embedding provider unavailable ({}): {e}", self.ollama_url))?;
+
+        if !resp.status().is_success() {
+            return Err(format!(
+                "Embedding provider unavailable ({}): HTTP {}",
+                self.ollama_url,
+                resp.status()
+            ));
         }
-        self.fallback.embed(text).await
+
+        let parsed = resp
+            .json::<OllamaEmbedResp>()
+            .await
+            .map_err(|e| format!("Invalid embedding payload: {e}"))?;
+
+        let vec = parsed
+            .embeddings
+            .and_then(|mut v| if v.is_empty() { None } else { Some(v.remove(0)) })
+            .or(parsed.embedding)
+            .ok_or_else(|| "Embedding response missing vector".to_string())?;
+
+        if vec.len() != self.dim {
+            return Err(format!(
+                "Embedding dimension mismatch for '{}': expected {}, got {}",
+                self.model,
+                self.dim,
+                vec.len()
+            ));
+        }
+        Ok(vec)
+    }
+}
+
+/// Builds the configured embedding provider (`ollama` by default, `local` for tests/CI).
+pub fn build_embedder_from_env() -> std::sync::Arc<dyn EmbeddingProvider> {
+    let provider = std::env::var("RAG_EMBED_PROVIDER").unwrap_or_else(|_| "ollama".to_string());
+    let dim: usize = std::env::var("RAG_EMBED_DIM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(768);
+    if provider.eq_ignore_ascii_case("local") {
+        std::sync::Arc::new(LocalHashEmbedder::new(dim))
+    } else {
+        let ollama_url = std::env::var("RAG_OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434".to_string());
+        let model = std::env::var("RAG_EMBED_MODEL").unwrap_or_else(|_| "nomic-embed-text".to_string());
+        std::sync::Arc::new(OllamaEmbedder::new(ollama_url, model, dim))
     }
 }

@@ -1,9 +1,8 @@
 use std::sync::Arc;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use rag::application::ports::EmbeddingProvider;
 use rag::application::service::RagService;
-use rag::infrastructure::embeddings::FallbackEmbedder;
+use rag::infrastructure::embeddings::build_embedder_from_env;
 use rag::infrastructure::mcp::handle_jsonrpc;
 use rag::infrastructure::postgres::PostgresRagRepository;
 
@@ -11,14 +10,13 @@ use rag::infrastructure::postgres::PostgresRagRepository;
 async fn main() {
     let dsn = std::env::var("RAG_DATABASE_URL")
         .unwrap_or_else(|_| "postgresql://rag_admin:rag_dev_password@localhost:5433/rag_db".to_string());
-    let ollama_url = std::env::var("RAG_OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434".to_string());
-    let embed_model = std::env::var("RAG_EMBED_MODEL").unwrap_or_else(|_| "nomic-embed-text".to_string());
 
     let repo = PostgresRagRepository::connect(&dsn).await.expect("Failed to connect to Postgres");
     repo.run_migrations().await.expect("Failed to run migrations");
 
-    let embedder: Arc<dyn EmbeddingProvider> = Arc::new(FallbackEmbedder::new(ollama_url, embed_model, 768));
-    let service = Arc::new(RagService::new(Arc::new(repo), embedder));
+    let embedder = build_embedder_from_env();
+    let service = Arc::new(RagService::new(Arc::new(repo.clone()), embedder));
+    let _listener_handle = repo.spawn_cache_invalidation_listener(service.clone());
 
     let stdin = BufReader::new(io::stdin());
     let mut lines = stdin.lines();

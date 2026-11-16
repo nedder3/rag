@@ -108,11 +108,36 @@ pub struct GraphNeighbor {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResponse {
+    pub trace_id: Option<i64>,
     pub collection: String,
     pub cache_hit: bool,
     pub latency_ms: f64,
     pub results: Vec<SearchHit>,
     pub graph_neighbors: Vec<GraphNeighbor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceFeedbackRequest {
+    pub trace_id: i64,
+    #[serde(default = "default_repo")]
+    pub role: String,
+    pub chosen: String,
+    #[serde(default)]
+    pub rejected: Option<String>,
+    #[serde(default = "default_weight")]
+    pub reward: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DpoExportRecord {
+    pub trace_id: i64,
+    pub collection: String,
+    pub role: String,
+    pub prompt: String,
+    pub retrieved_contexts: Value,
+    pub chosen: String,
+    pub rejected: Option<String>,
+    pub reward: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
