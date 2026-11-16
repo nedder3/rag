@@ -211,8 +211,22 @@ async fn tdd_postgres_hybrid_graph_notify_invalidation_dpo_and_model_guard() {
         .unwrap();
     assert_eq!(fb_resp.status(), StatusCode::OK);
 
-    let dpo_resp = app
+    // Default TRL/Unsloth/Axolotl JSONL format
+    let dpo_jsonl_resp = app
+        .clone()
         .oneshot(Request::builder().uri("/v1/export/dpo?limit=10").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(dpo_jsonl_resp.status(), StatusCode::OK);
+    let dpo_jsonl_body = String::from_utf8(dpo_jsonl_resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    let first_line: Value = serde_json::from_str(dpo_jsonl_body.lines().next().unwrap()).unwrap();
+    assert!(first_line["prompt"].as_str().unwrap().contains("Context:\n[1]"));
+    assert_eq!(first_line["chosen"], "Veredicto fundamentado con cita exacta.");
+    assert_eq!(first_line["rejected"], "Afirmación sin respaldo.");
+
+    // Explicit JSON inspection format
+    let dpo_resp = app
+        .oneshot(Request::builder().uri("/v1/export/dpo?limit=10&format=json").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(dpo_resp.status(), StatusCode::OK);

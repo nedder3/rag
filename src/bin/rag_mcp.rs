@@ -5,6 +5,7 @@ use rag::application::service::RagService;
 use rag::infrastructure::embeddings::build_embedder_from_env;
 use rag::infrastructure::mcp::handle_jsonrpc;
 use rag::infrastructure::postgres::PostgresRagRepository;
+use rag::infrastructure::reranker::build_reranker_from_env;
 
 #[tokio::main]
 async fn main() {
@@ -15,7 +16,8 @@ async fn main() {
     repo.run_migrations().await.expect("Failed to run migrations");
 
     let embedder = build_embedder_from_env();
-    let service = Arc::new(RagService::new(Arc::new(repo.clone()), embedder));
+    let reranker = build_reranker_from_env();
+    let service = Arc::new(RagService::with_reranker(Arc::new(repo.clone()), embedder, reranker));
     let _listener_handle = repo.spawn_cache_invalidation_listener(service.clone());
 
     let stdin = BufReader::new(io::stdin());

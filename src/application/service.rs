@@ -3,11 +3,12 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::application::ports::{EmbeddingProvider, RagRepository};
+use crate::application::ports::{EmbeddingProvider, RagRepository, Reranker};
 use crate::domain::models::{
     DpoExportRecord, GraphEdge, GraphNeighbor, GraphNode, IngestDocument, QueryOptions, QueryResponse,
     SearchHit, TelemetrySnapshot, TraceFeedbackRequest,
 };
+use crate::infrastructure::reranker::LexicalBoostReranker;
 
 struct CacheState {
     embed: LruCache<String, Vec<f32>>,
@@ -24,15 +25,25 @@ struct CacheState {
 pub struct RagService {
     repo: Arc<dyn RagRepository>,
     embedder: Arc<dyn EmbeddingProvider>,
+    reranker: Arc<dyn Reranker>,
     state: Mutex<CacheState>,
 }
 
 impl RagService {
     pub fn new(repo: Arc<dyn RagRepository>, embedder: Arc<dyn EmbeddingProvider>) -> Self {
+        Self::with_reranker(repo, embedder, Arc::new(LexicalBoostReranker))
+    }
+
+    pub fn with_reranker(
+        repo: Arc<dyn RagRepository>,
+        embedder: Arc<dyn EmbeddingProvider>,
+        reranker: Arc<dyn Reranker>,
+    ) -> Self {
         let cap = NonZeroUsize::new(512).unwrap();
         Self {
             repo,
             embedder,
+            reranker,
             state: Mutex::new(CacheState {
                 embed: LruCache::new(cap),
                 query: LruCache::new(cap),
@@ -135,7 +146,8 @@ impl RagService {
                 st.cache_misses += 1;
             }
             let qvec = self.embed_cached(&q_trim).await?;
-            let hits = self.repo.hybrid_search(&opts.collection, &q_trim, &qvec, limit).await?;
+            let raw_hits = self.repo.hybrid_search(&opts.collection, &q_trim, &qvec, (limit * 3).max(12)).await?;
+            let hits = self.reranker.rerank(&q_trim, raw_hits, limit).await;
             if let Ok(mut st) = self.state.lock() {
                 st.query.put(qkey, hits.clone());
             }

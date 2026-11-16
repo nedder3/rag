@@ -1,5 +1,6 @@
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -18,6 +19,7 @@ pub struct GraphIngestBody {
 #[derive(Deserialize)]
 pub struct ExportQuery {
     pub limit: Option<usize>,
+    pub format: Option<String>,
 }
 
 pub fn build_router(service: Arc<RagService>) -> Router {
@@ -94,11 +96,50 @@ async fn feedback(
 async fn export_dpo(
     State(svc): State<Arc<RagService>>,
     Query(q): Query<ExportQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match svc.export_dpo(q.limit.unwrap_or(500)).await {
-        Ok(records) => Ok(Json(json!({"count": records.len(), "records": records}))),
-        Err(e) => Err(map_service_err(e)),
+) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    let records = svc.export_dpo(q.limit.unwrap_or(500)).await.map_err(map_service_err)?;
+    let fmt = q.format.unwrap_or_else(|| "trl_jsonl".to_string());
+    if fmt == "json" {
+        return Ok((
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&json!({"count": records.len(), "records": records})).unwrap(),
+        ));
     }
+    let mut lines = Vec::with_capacity(records.len());
+    for rec in records {
+        let ctx_str = rec
+            .retrieved_contexts
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .enumerate()
+                    .filter_map(|(i, item)| {
+                        item.get("content")
+                            .and_then(|c| c.as_str())
+                            .map(|c| format!("[{}] {}", i + 1, c))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        let formatted_prompt = if ctx_str.is_empty() {
+            rec.prompt
+        } else {
+            format!("Context:\n{ctx_str}\n\nQuery:\n{}", rec.prompt)
+        };
+        let row = json!({
+            "prompt": formatted_prompt,
+            "chosen": rec.chosen,
+            "rejected": rec.rejected.unwrap_or_default(),
+        });
+        lines.push(row.to_string());
+    }
+    let body = if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    };
+    Ok(([(header::CONTENT_TYPE, "application/x-ndjson")], body))
 }
 
 async fn metrics(State(svc): State<Arc<RagService>>) -> Json<Value> {

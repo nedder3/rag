@@ -12,6 +12,11 @@ pub trait EmbeddingProvider: Send + Sync {
 }
 
 #[async_trait]
+pub trait Reranker: Send + Sync {
+    async fn rerank(&self, query: &str, hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit>;
+}
+
+#[async_trait]
 pub trait RagRepository: Send + Sync {
     async fn health_count(&self) -> Result<i64, String>;
     async fn ensure_collection_model(&self, collection: &str, model: &str, dimensions: usize) -> Result<(), String>;

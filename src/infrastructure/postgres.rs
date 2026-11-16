@@ -64,23 +64,30 @@ impl PostgresRagRepository {
     }
 
     /// Spawns a background Tokio task listening to `rag_cache_invalidate` NOTIFY events
-    /// so L1 caches stay consistent across `rag-server`, `rag-mcp`, and replicas.
+    /// with exponential backoff (1s -> 2s -> 4s -> 8s -> 30s).
+    /// Clears L1 cache upon every (re)connection so missed notifications never leave stale entries.
     pub fn spawn_cache_invalidation_listener(&self, service: Arc<RagService>) -> tokio::task::JoinHandle<()> {
         let pool = self.pool.clone();
         tokio::spawn(async move {
+            let mut backoff_secs = 1u64;
             loop {
                 match PgListener::connect_with(&pool).await {
                     Ok(mut listener) => {
                         if listener.listen("rag_cache_invalidate").await.is_err() {
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                            backoff_secs = (backoff_secs * 2).min(30);
                             continue;
                         }
+                        backoff_secs = 1;
+                        // Flush L1 on (re)subscribe in case writes happened while disconnected
+                        service.clear_cache();
                         while let Ok(_notif) = listener.recv().await {
                             service.clear_cache();
                         }
                     }
                     Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(30);
                     }
                 }
             }
@@ -446,6 +453,7 @@ impl RagRepository for PostgresRagRepository {
                    t.retrieved_contexts, f.chosen, f.rejected, f.reward
             FROM rag_store.trace_feedback f
             JOIN rag_store.query_traces t ON t.id = f.trace_id
+            WHERE f.rejected IS NOT NULL AND length(trim(f.rejected)) > 0
             ORDER BY f.id DESC
             LIMIT $1
             "#,
